@@ -6,14 +6,27 @@ macOS에서 만든 뒤 Windows로 옮긴 **파일·폴더 이름**이 한글 자
 
 ## 실행 파일(EXE) 다운로드
 
-Python 없이 **Windows 64비트**에서 바로 쓰려면 아래에서 `JamoCombine.exe`를 받으면 됩니다.
+Python 없이 **Windows 64비트**에서 바로 쓰려면 GitHub **Releases**에서 `JamoCombine.exe`를 받으면 됩니다.
 
 | 설명 | 링크 |
 |------|------|
-| **최신 EXE 직접 다운로드** | [JamoCombine.exe (latest)](https://github.com/shoutjoy/jamo_combine/releases/latest/download/JamoCombine.exe) |
-| **릴리스 목록·이전 버전** | [Releases](https://github.com/shoutjoy/jamo_combine/releases/latest) |
+| **릴리스·Assets (항상 열림)** | [github.com/shoutjoy/jamo_combine/releases](https://github.com/shoutjoy/jamo_combine/releases) |
+| **최신 EXE 고정 주소** | […/latest/download/JamoCombine.exe](https://github.com/shoutjoy/jamo_combine/releases/latest/download/JamoCombine.exe) |
 
-> **관리자 참고:** 위 “직접 다운로드” 주소는 GitHub Releases의 **가장 최신 릴리스**에 첨부된 파일 이름이 정확히 `JamoCombine.exe`일 때만 동작합니다. `build_exe.cmd`로 만든 `dist\JamoCombine.exe`를 릴리스 Assets에 그 이름으로 올려 주세요.
+마지막 주소는 GitHub 규칙상 **게시된 최신 릴리스**에 이름이 정확히 `JamoCombine.exe`인 파일이 붙어 있을 때만 열립니다. 릴리스가 없거나 파일 이름이 다르면 **404**가 납니다.
+
+### 직접 링크를 살리는 방법 (저장소 관리자)
+
+1. **태그로 자동 빌드·업로드 (권장)**  
+   로컬에서 `build_exe.cmd`로 확인한 뒤, 저장소에 푸시합니다.
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+   GitHub Actions(`.github/workflows/build-release-exe.yml`)가 Windows에서 EXE를 만들고, 같은 이름의 릴리스에 **`JamoCombine.exe`** 를 올립니다. 완료 후 위 “최신 EXE 고정 주소”가 동작합니다.
+
+2. **수동 업로드**  
+   GitHub 웹에서만 릴리스를 만들었다면 `build_exe.cmd`로 만든 `dist\JamoCombine.exe`를 Assets에 **파일 이름 그대로** `JamoCombine.exe`로 올리면 됩니다. (이름이 `JamoCombine_v1.exe`처럼 바뀌면 고정 다운로드 URL은 404가 납니다.)
 
 EXE 사용 시: 원하는 폴더에 두고 실행하거나, 앱에서 **「우클릭 메뉴에 등록」**, **「시작 메뉴 바로가기」** 버튼으로 연동하면 됩니다. (소스 설치용 `install.cmd`는 필수가 아닙니다.)
 
