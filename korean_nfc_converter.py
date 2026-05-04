@@ -38,6 +38,26 @@ def load_close_after_pref():
         return False
 
 
+def is_frozen():
+    """PyInstaller 등으로 패키징된 단일 실행 파일인지 여부."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_install_dir():
+    """실행 파일(.exe) 또는 스크립트가 있는 폴더."""
+    if is_frozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def explorer_menu_command(path_placeholder):
+    """탐색기 우클릭 레지스트리용 실행 문자열. path_placeholder는 %1 또는 %V."""
+    if is_frozen():
+        return f'"{os.path.abspath(sys.executable)}" "{path_placeholder}"'
+    script = os.path.abspath(sys.argv[0])
+    return f'"{sys.executable}" "{script}" "{path_placeholder}"'
+
+
 def save_close_after_pref(value):
     d = os.path.dirname(settings_path())
     try:
@@ -177,10 +197,7 @@ class NFCNormalizerApp:
             reg.SetValue(key, "", reg.REG_SZ, "한글 자모 결합 (NFC 변환)")
         command_path = key_path + r"\command"
         with reg.CreateKey(hkey, command_path) as key:
-            executable = sys.executable
-            script_path = os.path.abspath(sys.argv[0])
-            cmd = f'"{executable}" "{script_path}" "{path_placeholder}"'
-            reg.SetValue(key, "", reg.REG_SZ, cmd)
+            reg.SetValue(key, "", reg.REG_SZ, explorer_menu_command(path_placeholder))
 
     def _start_menu_programs_dir(self):
         return os.path.join(
@@ -205,14 +222,17 @@ class NFCNormalizerApp:
             else "JamoCombine.lnk"
         )
         link_path = os.path.join(programs, name)
-        py = sys.executable
-        script = os.path.abspath(sys.argv[0])
-        inst_dir = os.path.dirname(script)
-        args = f'"{script}"'
-        if close_after:
-            args += " --close-after-run"
+        py = os.path.abspath(sys.executable)
+        inst_dir = app_install_dir()
+        if is_frozen():
+            args = "--close-after-run" if close_after else "--keep-open"
         else:
-            args += " --keep-open"
+            script = os.path.abspath(sys.argv[0])
+            args = f'"{script}"'
+            if close_after:
+                args += " --close-after-run"
+            else:
+                args += " --keep-open"
         desc = "한글 자모 결합기 (NFC)" + (" · 완료 후 종료" if close_after else " · 창 유지")
         ps = (
             "$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LINK); "
