@@ -1,5 +1,7 @@
+import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -58,6 +60,40 @@ def explorer_menu_command(path_placeholder):
     return f'"{sys.executable}" "{script}" "{path_placeholder}"'
 
 
+def notify_shell_context_menus_changed():
+    """레지스트리 shell 항목 변경 후 탐색기 등이 캐시를 갱신하도록 알린다."""
+    try:
+        SHCNE_ASSOCCHANGED = 0x08000000
+        SHCNF_IDLIST = 0x0000
+        SHCNF_FLUSH = 0x1000
+        ctypes.windll.shell32.SHChangeNotify(
+            SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None
+        )
+    except OSError:
+        pass
+
+
+# EXE 배포 시 고정 설치 경로 (사용자 요청: 시스템 드라이브\Program\Jamo)
+_sd = os.environ.get("SystemDrive", "C:")
+_sd_root = _sd if _sd.endswith(("/", "\\")) else _sd + os.sep
+PROGRAM_JAMO_INSTALL_DIR = os.path.join(_sd_root, "Program", "Jamo")
+PROGRAM_JAMO_EXE_NAME = "JamoCombine.exe"
+
+
+def context_menu_success_hint():
+    """Windows 11+ 기본 우클릭 메뉴에 레거시 항목이 숨겨질 수 있음을 안내한다."""
+    try:
+        v = sys.getwindowsversion()
+        if v.major >= 10 and v.build >= 22000:
+            return (
+                "\n\nWindows 11에서는 기본 우클릭 메뉴 대신\n"
+                "「추가 옵션 표시」또는 Shift+우클릭(전체 메뉴)에서 항목을 확인하세요."
+            )
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return ""
+
+
 def save_close_after_pref(value):
     d = os.path.dirname(settings_path())
     try:
@@ -76,6 +112,57 @@ def save_close_after_pref(value):
         pass
 
 
+def wsh_create_shortcut(link_path, target_path, arguments, working_dir, description):
+    """WScript.Shell 로 .lnk 를 만든다."""
+    link_dir = os.path.dirname(link_path)
+    if link_dir:
+        os.makedirs(link_dir, exist_ok=True)
+    ps = (
+        "$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LINK); "
+        "$sc.TargetPath = $env:PY; "
+        "$sc.Arguments = $env:ARGS; "
+        "$sc.WorkingDirectory = $env:CWD; "
+        "$sc.Description = $env:DESC; "
+        "$sc.Save()"
+    )
+    env = os.environ.copy()
+    env["LINK"] = link_path
+    env["PY"] = target_path
+    env["ARGS"] = arguments
+    env["CWD"] = working_dir
+    env["DESC"] = description
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+        ],
+        check=True,
+        env=env,
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if sys.platform == "win32"
+            else 0
+        ),
+    )
+
+
+def taskbar_pinned_shortcut_path():
+    """사용자 작업 표시줄 고정 폴더에 둘 JamoCombine 바로가기 경로."""
+    return os.path.join(
+        os.environ.get("APPDATA", ""),
+        "Microsoft",
+        "Internet Explorer",
+        "Quick Launch",
+        "User Pinned",
+        "TaskBar",
+        "JamoCombine.lnk",
+    )
+
+
 class NFCNormalizerApp:
     """
     macOS의 NFD 방식 파일명을 NFC 방식으로 일괄 변환하며, 
@@ -84,7 +171,8 @@ class NFCNormalizerApp:
     def __init__(self, root, *, launch_mode=None, positional_paths=None):
         self.root = root
         self.root.title("한글 자모 결합기 (NFD → NFC)")
-        self.root.geometry("600x620")
+        self.root.geometry("640x800")
+        self.root.minsize(520, 560)
 
         # UI 스타일 설정
         style = ttk.Style()
@@ -107,37 +195,174 @@ class NFCNormalizerApp:
                 self.log(f"전달된 경로: {p}")
                 break
 
+    def _bind_scroll_canvas(self, canvas):
+        def _wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+    def _make_scroll_body(self, parent):
+        """세로 스크롤이 있는 (wrap, canvas, body) 튜플을 만든다."""
+        wrap = tk.Frame(parent)
+        canvas = tk.Canvas(wrap, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def on_body_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            w = max(event.width, 1)
+            canvas.itemconfigure(inner_id, width=w)
+
+        body.bind("<Configure>", on_body_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        self._bind_scroll_canvas(canvas)
+        return wrap, canvas, body
+
     def setup_ui(self):
-        # 상단 설명 레이블
         instruction = (
             "이 프로그램은 맥(macOS)에서 만들어져 자모가 분리된 파일명을\n"
             "윈도우 표준인 결합된 한글 형태로 복원합니다."
         )
-        tk.Label(self.root, text=instruction, pady=10, justify="center").pack()
 
-        # 경로 선택 영역
-        path_frame = tk.LabelFrame(self.root, text="대상 폴더 경로", padx=10, pady=10)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
+
+        tab_convert = tk.Frame(self.notebook)
+        tab_convert.grid_columnconfigure(0, weight=1)
+        tab_convert.grid_rowconfigure(3, weight=1)
+        self.notebook.add(tab_convert, text="변환")
+
+        # 상단(안내·폴더)은 내용 높이만큼만 — 스크롤 캔버스에 weight 를 주면 빈 여백이 커진다.
+        body_main = tk.Frame(tab_convert)
+        body_main.grid(row=0, column=0, sticky="new")
+
+        tk.Label(body_main, text=instruction, pady=10, justify="center").pack()
+
+        path_frame = tk.LabelFrame(body_main, text="대상 폴더 경로", padx=10, pady=10)
         path_frame.pack(fill="x", padx=20, pady=5)
-        
+
         self.path_var = tk.StringVar()
         self.path_entry = tk.Entry(path_frame, textvariable=self.path_var)
         self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        
+
         btn_browse = ttk.Button(path_frame, text="폴더 선택", command=self.browse_folder)
         btn_browse.pack(side="right")
 
-        # 익스플로러 메뉴 설정 영역
-        explorer_frame = tk.LabelFrame(self.root, text="윈도우 탐색기 통합", padx=10, pady=10)
+        self.recursive_var = tk.BooleanVar(value=True)
+        opts = tk.Frame(tab_convert)
+        opts.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 4))
+        tk.Checkbutton(opts, text="하위 폴더 포함", variable=self.recursive_var).pack(anchor="w")
+        tk.Checkbutton(
+            opts,
+            text="변환 완료 후 프로그램 종료",
+            variable=self.close_after_var,
+            command=lambda: save_close_after_pref(self.close_after_var.get()),
+        ).pack(anchor="w")
+
+        tk.Label(tab_convert, text="처리 기록:").grid(
+            row=2, column=0, sticky="w", padx=20, pady=(6, 0)
+        )
+        self.log_text = tk.Text(tab_convert, height=6, state="disabled", bg="#f0f0f0")
+        self.log_text.grid(row=3, column=0, sticky="nsew", padx=20, pady=5)
+
+        self.btn_run = ttk.Button(tab_convert, text="변환 시작", command=self.run_normalization)
+        self.btn_run.grid(row=4, column=0, pady=(0, 10))
+
+        # —— 설정 탭: 앱 설치, 탐색기 통합, 시작 메뉴 바로가기 ——
+        tab_settings = tk.Frame(self.notebook)
+        tab_settings.grid_columnconfigure(0, weight=1)
+        tab_settings.grid_rowconfigure(0, weight=1)
+        self.notebook.add(tab_settings, text="설정")
+
+        wrap_set, _canvas_set, body_set = self._make_scroll_body(tab_settings)
+        wrap_set.grid(row=0, column=0, sticky="nsew")
+
+        install_shell = tk.Frame(body_set)
+        install_shell.pack(fill="x", padx=20, pady=5)
+        self._install_expanded = False
+        self.btn_install_fold = ttk.Button(
+            install_shell,
+            text="앱 설치 ▼ 펼치기 (최초 1회 권장)",
+            command=self._toggle_install_fold,
+        )
+        self.btn_install_fold.pack(anchor="w")
+
+        self._install_detail = tk.LabelFrame(
+            install_shell,
+            text="앱 설치",
+            padx=10,
+            pady=10,
+        )
+        ttk.Button(
+            self._install_detail,
+            text="설치 (Install) — C:\\Program\\Jamo 에 복사",
+            command=self.install_to_program_jamo,
+        ).pack(fill="x", padx=5, pady=2)
+        self.install_add_start_menu_var = tk.BooleanVar(value=True)
+        self.install_pin_taskbar_var = tk.BooleanVar(value=False)
+        cb_row = tk.Frame(self._install_detail)
+        cb_row.pack(fill="x", padx=5, pady=(2, 0))
+        tk.Checkbutton(
+            cb_row,
+            text="설치 후 시작 메뉴에 바로가기 만들기",
+            variable=self.install_add_start_menu_var,
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            cb_row,
+            text="작업 표시줄 고정용 바로가기 만들기 (자동 고정은 Windows에서 제한될 수 있음)",
+            variable=self.install_pin_taskbar_var,
+        ).pack(anchor="w")
+        tk.Label(
+            self._install_detail,
+            text=(
+                "JamoCombine.exe 로 실행 중일 때 설치 버튼으로 고정 폴더에 복사합니다. "
+                "※ 같은 폴더에서 이미 실행 중이면 복사 없이, 체크한 바로가기만 만들 수 있습니다.\n"
+                "바로가기의 실행 옵션(창 유지/종료)은 「변환」탭의 「변환 완료 후 프로그램 종료」와 동일합니다.\n"
+                "Python 스크립트로만 실행 중이면 설치 시 안내 메시지가 표시됩니다."
+            ),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=5, pady=(4, 0))
+
+        explorer_frame = tk.LabelFrame(body_set, text="윈도우 탐색기 통합", padx=10, pady=10)
         explorer_frame.pack(fill="x", padx=20, pady=5)
-        
-        btn_register = ttk.Button(explorer_frame, text="우클릭 메뉴에 등록", command=self.register_context_menu)
+
+        btn_register = ttk.Button(
+            explorer_frame,
+            text="우클릭 메뉴에 등록",
+            command=self.register_context_menu,
+        )
         btn_register.pack(side="left", expand=True, padx=5)
-        
-        btn_unregister = ttk.Button(explorer_frame, text="우클릭 메뉴에서 제거", command=self.unregister_context_menu)
+
+        btn_unregister = ttk.Button(
+            explorer_frame,
+            text="우클릭 메뉴에서 제거",
+            command=self.unregister_context_menu,
+        )
         btn_unregister.pack(side="left", expand=True, padx=5)
 
-        start_frame = tk.LabelFrame(self.root, text="시작 메뉴 바로가기", padx=10, pady=10)
-        start_frame.pack(fill="x", padx=20, pady=5)
+        tk.Label(
+            body_set,
+            text=(
+                "※ 탐색기에서「한글 자모 결합 (NFC 변환)」이 안 보이면: "
+                "Windows 11은 우클릭 후 「추가 옵션 표시」 또는 Shift+우클릭으로 전체(클래식) 메뉴를 여세요. "
+                "등록 직후에는 탐색기를 모두 닫았다가 다시 열거나, 안 되면 PC 재시작 후 확인하세요."
+            ),
+            justify="left",
+            wraplength=520,
+            fg="#333",
+        ).pack(anchor="w", padx=20, pady=(0, 6))
+
+        start_frame = tk.LabelFrame(body_set, text="시작 메뉴 바로가기 (수동)", padx=10, pady=10)
+        start_frame.pack(fill="x", padx=20, pady=(5, 16))
         ttk.Button(
             start_frame,
             text="등록 · 변환 후에도 창 유지",
@@ -149,31 +374,126 @@ class NFCNormalizerApp:
             command=lambda: self.register_start_menu_shortcut(close_after=True),
         ).pack(side="left", expand=True, padx=5)
 
-        # 옵션 설정
-        self.recursive_var = tk.BooleanVar(value=True)
-        opts = tk.Frame(self.root)
-        opts.pack(anchor="w", padx=20)
-        tk.Checkbutton(opts, text="하위 폴더 포함", variable=self.recursive_var).pack(anchor="w")
-        tk.Checkbutton(
-            opts,
-            text="변환 완료 후 프로그램 종료",
-            variable=self.close_after_var,
-            command=lambda: save_close_after_pref(self.close_after_var.get()),
-        ).pack(anchor="w")
-
-        # 결과 로그 영역
-        tk.Label(self.root, text="처리 기록:").pack(anchor="w", padx=20, pady=(10, 0))
-        self.log_text = tk.Text(self.root, height=12, state="disabled", bg="#f0f0f0")
-        self.log_text.pack(fill="both", padx=20, pady=5, expand=True)
-
-        # 실행 버튼
-        self.btn_run = ttk.Button(self.root, text="변환 시작", command=self.run_normalization)
-        self.btn_run.pack(pady=10)
+    def _toggle_install_fold(self):
+        """앱 설치 블록 펼치기 / 접기."""
+        self._install_expanded = not self._install_expanded
+        if self._install_expanded:
+            self._install_detail.pack(fill="x", pady=(6, 0))
+            self.btn_install_fold.configure(text="앱 설치 ▲ 접기")
+        else:
+            self._install_detail.pack_forget()
+            self.btn_install_fold.configure(
+                text="앱 설치 ▼ 펼치기 (최초 1회 권장)"
+            )
 
     def browse_folder(self):
         folder_selected = filedialog.askdirectory()
         if folder_selected:
             self.path_var.set(folder_selected)
+
+    def install_to_program_jamo(self):
+        """EXE만: Program\\Jamo 로 복사하고, 선택 시 시작 메뉴·작업 표시줄용 .lnk 를 만든다."""
+        if not is_frozen():
+            messagebox.showinfo(
+                "알림",
+                "이 설치(복사) 기능은 JamoCombine.exe 로 실행했을 때 사용할 수 있습니다.",
+            )
+            return
+
+        dest_dir = os.path.normpath(PROGRAM_JAMO_INSTALL_DIR)
+        dest_exe = os.path.join(dest_dir, PROGRAM_JAMO_EXE_NAME)
+        norm_src = os.path.normcase(os.path.normpath(os.path.abspath(sys.executable)))
+        norm_dest = os.path.normcase(os.path.normpath(dest_exe))
+
+        want_sm = self.install_add_start_menu_var.get()
+        want_tb = self.install_pin_taskbar_var.get()
+
+        if norm_src == norm_dest:
+            if not want_sm and not want_tb:
+                messagebox.showinfo(
+                    "알림",
+                    f"이미 설치 경로에서 실행 중입니다.\n{dest_exe}\n"
+                    "시작 메뉴·작업 표시줄 바로가기를 만들려면 체크한 뒤 다시 누르세요.",
+                )
+                self.log(f"설치: 이미 {dest_exe} (바로가기 옵션 없음)")
+                return
+        else:
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror(
+                    "오류",
+                    f"폴더를 만들 수 없습니다.\n{dest_dir}\n\n{e}\n\n"
+                    "시스템 드라이브 루트에 쓰기 권한이 없을 수 있습니다. "
+                    "앱을「관리자 권한으로 실행」한 뒤 다시 시도해 보세요.",
+                )
+                return
+            try:
+                shutil.copy2(os.path.abspath(sys.executable), dest_exe)
+            except OSError as e:
+                messagebox.showerror(
+                    "오류",
+                    f"파일을 복사할 수 없습니다.\n→ {dest_exe}\n\n{e}\n\n"
+                    "대상 위치의 JamoCombine.exe 가 실행 중이면 종료한 뒤 다시 시도하세요.",
+                )
+                return
+            self.log(f"복사 완료: {dest_exe}")
+
+        close_after = self.close_after_var.get()
+        args = "--close-after-run" if close_after else "--keep-open"
+        desc = "한글 자모 결합기 (NFC)" + (
+            " · 완료 후 종료" if close_after else " · 창 유지"
+        )
+
+        done = []
+        warn = []
+
+        if want_sm:
+            name = (
+                "JamoCombine (변환 후 종료).lnk"
+                if close_after
+                else "JamoCombine.lnk"
+            )
+            link_path = os.path.join(self._start_menu_programs_dir(), name)
+            try:
+                wsh_create_shortcut(link_path, dest_exe, args, dest_dir, desc)
+                done.append(f"시작 메뉴: {name}")
+                self.log(f"바로가기: {link_path}")
+            except (OSError, subprocess.CalledProcessError) as e:
+                warn.append(f"시작 메뉴 바로가기: {e}")
+
+        if want_tb:
+            tb_link = taskbar_pinned_shortcut_path()
+            try:
+                wsh_create_shortcut(
+                    tb_link,
+                    dest_exe,
+                    args,
+                    dest_dir,
+                    desc + " · 작업 표시줄",
+                )
+                done.append("작업 표시줄 고정 폴더에 바로가기 저장")
+                self.log(f"바로가기: {tb_link}")
+            except (OSError, subprocess.CalledProcessError) as e:
+                warn.append(f"작업 표시줄 바로가기: {e}")
+
+        lines = [f"설치 경로: {dest_exe}", ""]
+        if done:
+            lines.append("\n".join(done))
+        if warn:
+            lines.append("")
+            lines.append("주의:\n" + "\n".join(warn))
+        lines.append("")
+        lines.append(
+            "우클릭 메뉴는 위 경로의 exe를 실행한 뒤 「우클릭 메뉴에 등록」하는 것을 권장합니다."
+        )
+        if want_tb:
+            lines.append(
+                "작업 표시줄에 안 보이면: 시작 메뉴에서 이 앱을 연 뒤 "
+                "작업 표시줄 아이콘을 마우스 오른쪽 버튼 → 작업 표시줄에 고정."
+            )
+
+        messagebox.showinfo("완료", "\n".join(lines))
 
     def log(self, message):
         self.log_text.config(state="normal")
@@ -234,38 +554,8 @@ class NFCNormalizerApp:
             else:
                 args += " --keep-open"
         desc = "한글 자모 결합기 (NFC)" + (" · 완료 후 종료" if close_after else " · 창 유지")
-        ps = (
-            "$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LINK); "
-            "$sc.TargetPath = $env:PY; "
-            "$sc.Arguments = $env:ARGS; "
-            "$sc.WorkingDirectory = $env:CWD; "
-            "$sc.Description = $env:DESC; "
-            "$sc.Save()"
-        )
-        env = os.environ.copy()
-        env["LINK"] = link_path
-        env["PY"] = py
-        env["ARGS"] = args
-        env["CWD"] = inst_dir
-        env["DESC"] = desc
         try:
-            subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps,
-                ],
-                check=True,
-                env=env,
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    if sys.platform == "win32"
-                    else 0
-                ),
-            )
+            wsh_create_shortcut(link_path, py, args, inst_dir, desc)
             messagebox.showinfo("성공", f"시작 메뉴에 등록했습니다.\n{name}")
         except (OSError, subprocess.CalledProcessError) as e:
             messagebox.showerror("오류", f"바로가기 만들기 실패: {e}")
@@ -281,11 +571,16 @@ class NFCNormalizerApp:
         try:
             for shell_parent, token in self._MENU_TARGETS:
                 self._write_one_context_menu(shell_parent, token)
+            notify_shell_context_menus_changed()
+            self.log("우클릭 등록 — 폴더 아이콘: " + explorer_menu_command("%1"))
+            self.log("우클릭 등록 — 폴더 안 빈 곳: " + explorer_menu_command("%V"))
             messagebox.showinfo(
                 "성공",
                 "탐색기에 등록했습니다.\n"
                 "· 폴더에서 우클릭\n"
-                "· 폴더 안 빈 곳에서 우클릭",
+                "· 폴더 안 빈 곳에서 우클릭\n\n"
+                "※ 우클릭 메뉴가 정상 동작하려면 PC를 다시 시작해 주세요."
+                + context_menu_success_hint(),
             )
         except Exception as e:
             messagebox.showerror("오류", f"메뉴 등록 중 오류 발생: {e}")
@@ -307,6 +602,7 @@ class NFCNormalizerApp:
         elif missing:
             messagebox.showinfo("알림", "등록된 메뉴가 없습니다.")
         else:
+            notify_shell_context_menus_changed()
             messagebox.showinfo("성공", "우클릭 메뉴에서 제거되었습니다.")
 
     def run_normalization(self):
